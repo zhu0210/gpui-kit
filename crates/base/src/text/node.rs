@@ -4188,7 +4188,9 @@ impl BlockNode {
                 } else {
                     0.
                 };
-                let max = device_ceil(w - divider);
+                // Layout rounds each cell edge to device pixels on its own, which
+                // can take one device pixel off the width; keep it in reserve.
+                let max = device_ceil(w - divider) + 1. / scale_factor;
                 TableColumn {
                     min: device_ceil(floor - divider).min(max),
                     max,
