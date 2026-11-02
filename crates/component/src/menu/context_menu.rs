@@ -7,11 +7,17 @@ use gpui::{
     Anchor, AnyElement, App, Bounds, Context, DismissEvent, Element, ElementId, Entity,
     FocusHandle, Focusable, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId,
     InteractiveElement, IntoElement, LayoutId, LongPressEvent, MouseButton, MouseDownEvent,
-    ParentElement, Pixels, Point, Position, Style, StyleRefinement, Styled, Subscription,
-    TouchPhase, Window, anchored, deferred, div, px,
+    ParentElement, Pixels, Point, Position, ScrollEvent, Style, StyleRefinement, Styled,
+    Subscription, TouchPhase, WeakEntity, Window, anchored, deferred, div, px,
 };
 
-use crate::{input::AnyInputState, menu::PopupMenu, root::WindowState};
+use crate::{actions::Cancel, input::AnyInputState, menu::PopupMenu, root::WindowState};
+
+thread_local! {
+    /// The context menu open last. Opening another closes it: a long press elsewhere is no press
+    /// outside it, so it would otherwise stay open beside the new one.
+    static OPEN_MENU: RefCell<Option<WeakEntity<PopupMenu>>> = const { RefCell::new(None) };
+}
 
 /// A extension trait for adding a context menu to an element.
 pub trait ContextMenuExt: InteractiveElement + ParentElement + Styled {
@@ -407,6 +413,37 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
             }
         });
 
+        // A finger that scrolls or long-presses outside the open menu closes it, as a press
+        // outside does: neither is a press, and the menu would otherwise stay over the content.
+        let open_menu = {
+            let state = request_layout.shared_state.borrow();
+            state.menu_view.clone().filter(|_| state.open)
+        };
+        if let Some(menu) = open_menu {
+            let outside = |menu: &Entity<PopupMenu>, at: Point<Pixels>, cx: &App| {
+                !menu.read(cx).bounds.contains(&at)
+            };
+            window.on_mouse_event({
+                let menu = menu.clone();
+                move |event: &ScrollEvent, phase, window, cx| {
+                    if phase.capture()
+                        && event.touch_phase == TouchPhase::Started
+                        && outside(&menu, event.position, cx)
+                    {
+                        menu.update(cx, |menu, cx| menu.dismiss(&Cancel, window, cx));
+                    }
+                }
+            });
+            window.on_mouse_event(move |event: &LongPressEvent, phase, window, cx| {
+                if phase.capture()
+                    && event.phase == TouchPhase::Started
+                    && outside(&menu, event.start_position, cx)
+                {
+                    menu.update(cx, |menu, cx| menu.dismiss(&Cancel, window, cx));
+                }
+            });
+        }
+
         if let Some(element) = &mut request_layout.element {
             element.paint(window, cx);
         }
@@ -472,12 +509,19 @@ fn open_menu(
                     .flatten()
                     .filter(|input| input.focus_handle(cx).is_focused(window))
                     .or(previous_selection_input);
+            let previous = OPEN_MENU
+                .with_borrow_mut(Option::take)
+                .and_then(|menu| menu.upgrade());
+            if let Some(previous) = previous {
+                previous.update(cx, |menu, cx| menu.dismiss(&Cancel, window, cx));
+            }
             let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
                 let Some(build) = &builder else {
                     return menu;
                 };
                 build(menu, window, cx)
             });
+            OPEN_MENU.set(Some(menu.downgrade()));
             let trigger_focus_handle = shared_state.borrow().trigger_focus_handle.clone();
             menu.update(cx, |menu, cx| {
                 menu.set_trigger_focus(trigger_focus_handle, cx);
@@ -867,5 +911,74 @@ mod tests {
             cx.debug_bounds("kbd:ctrl-c").is_some(),
             "the shortcut hint must be painted on the same frame as its item"
         );
+    }
+
+    /// Rows with their own ids, as a list of tiles: each has its own menu.
+    struct TilesRoot;
+
+    impl Render for TilesRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().children((0..3usize).map(|i| {
+                div()
+                    .id(("tile", i))
+                    .w(px(100.))
+                    .h(px(30.))
+                    .context_menu(move |menu, _, _| {
+                        menu.item(PopupMenuItem::element(move |_, _| {
+                            div()
+                                .debug_selector(move || format!("menu-of-{i}"))
+                                .child("Open")
+                        }))
+                    })
+            }))
+        }
+    }
+
+    #[gpui::test]
+    fn a_long_press_closes_the_menu_open_and_a_pan_closes_it_too(cx: &mut TestAppContext) {
+        cx.update(|cx| crate::init(cx));
+        let (_, cx) = cx.add_window_view(|_, _| TilesRoot);
+        let draw = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        };
+        draw(cx);
+        let long_press = |cx: &mut VisualTestContext, at: Point<Pixels>| {
+            cx.simulate_event(LongPressEvent {
+                phase: TouchPhase::Started,
+                start_position: at,
+                position: at,
+            });
+            cx.simulate_event(LongPressEvent {
+                phase: TouchPhase::Ended,
+                start_position: at,
+                position: at,
+            });
+        };
+        let open = |cx: &mut VisualTestContext| {
+            (0..3)
+                .filter(|i| {
+                    cx.debug_bounds(Box::leak(format!("menu-of-{i}").into_boxed_str()))
+                        .is_some()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        long_press(cx, point(px(10.), px(5.)));
+        draw(cx);
+        assert_eq!(open(cx), [0]);
+        // Another tile's menu takes its place.
+        long_press(cx, point(px(10.), px(65.)));
+        draw(cx);
+        assert_eq!(open(cx), [2]);
+        // A finger panning the content closes it.
+        let at = point(px(150.), px(40.));
+        cx.simulate_event(ScrollEvent {
+            position: at,
+            touch_phase: TouchPhase::Started,
+            ..Default::default()
+        });
+        draw(cx);
+        assert!(open(cx).is_empty());
     }
 }
