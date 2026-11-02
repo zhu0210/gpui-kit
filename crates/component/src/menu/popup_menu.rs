@@ -303,7 +303,7 @@ pub struct PopupMenu {
     min_width: Option<Pixels>,
     max_width: Option<Pixels>,
     max_height: Option<Pixels>,
-    bounds: Bounds<Pixels>,
+    pub(crate) bounds: Bounds<Pixels>,
     size: Size,
     check_side: Side,
     /// Indexes of the items added as options that can be checked, so an
@@ -1154,7 +1154,7 @@ impl PopupMenu {
     /// Dismiss the menu and the entire parent chain.
     ///
     /// The submenu is closed together with its parent, same as macOS menus.
-    fn dismiss(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn dismiss(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
         self.selected_index = None;
         cx.emit(DismissEvent);
 
